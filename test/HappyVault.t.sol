@@ -5,8 +5,10 @@ import {Test, console2} from "forge-std/Test.sol";
 import {HappyVault} from "../src/HappyVault.sol";
 import {HappyToken} from "../src/HappyToken.sol";
 import {MockToken} from "../src/mock/MockToken.sol";
+import {MerkleUtils} from "../src/utils/Merkle.sol";
+import {MerkleProof} from "openzeppelin-contracts/contracts/utils/cryptography/MerkleProof.sol";
 
-contract HappyVaultTest is Test {
+contract HappyVaultTest is Test, MerkleUtils {
     uint256 constant DAY = 86_400;
     uint256 constant STAKE_AMOUNT = 100_000 ether;
     uint256 constant SALE_AMOUNT = 30_000 ether;
@@ -32,16 +34,20 @@ contract HappyVaultTest is Test {
         assertEq(happy_vault.total_offerings(), 1);
     }
 
-    function test_addToWhitelist() public {
-        address[] memory whitelist = new address[](1);
-        whitelist[0] = address(this);
-        happy_vault.addToWhitelist(whitelist);
-        assertEq(happy_vault.whitelist(address(this)), true);
+    function test_setRoot() public {
+        bytes32[] memory leaves = new bytes32[](2);
+        leaves[0] = keccak256(abi.encode(address(this)));
+        leaves[1] = keccak256(abi.encode(address(this)));
+        bytes32 root = getRoot(leaves);
+        happy_vault.setRoot(root);
+        assertEq(happy_vault.root(), root);
+        bytes32[] memory proof = getProof(leaves, 1);
+        assertTrue(MerkleProof.verify(proof, root, leaves[1]));
     }
 
     function test_stake() public {
         test_createOffering();
-        test_addToWhitelist();
+        test_setRoot();
         assertEq(happy_vault.total_supply(), 0);
         assertEq(happy_vault.balances(address(this)), 0);
         happy_token.approve(address(happy_vault), STAKE_AMOUNT);

@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import "openzeppelin-contracts/contracts/utils/cryptography/MerkleProof.sol";
 
 contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
     uint256 immutable SCALE = 1e18;
@@ -26,10 +27,10 @@ contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
     }
     mapping(uint256 => Offering) public offerings;
     mapping(address => uint256) public balances;
-    mapping(address => bool) public whitelist;
     uint256 public total_supply;
     uint256 public total_offerings;
     address public happy_token;
+    bytes32 public root;
 
     constructor(address _happy_token) {
         happy_token = _happy_token;
@@ -50,6 +51,19 @@ contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
     event Withdrawn(address indexed user, uint256 amount);
     event OfferingCreated(uint256 indexed index);
     event Payment(address indexed user, uint256 indexed index, uint256 amount);
+
+    modifier checkWhitelist(bytes32[] calldata proof) {
+        if (
+            !MerkleProof.verify(proof, root, keccak256(abi.encode(msg.sender)))
+        ) {
+            revert NotWhitelisted(msg.sender);
+        }
+        _;
+    }
+
+    function setRoot(bytes32 _root) external onlyOwner {
+        root = _root;
+    }
 
     function payLimited(uint256 _index, uint256 _amount) external {
         if (offerings[_index].staking_finish < block.timestamp)
@@ -75,12 +89,6 @@ contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
         offerings[_index].paid[msg.sender] += _amount;
         offerings[_index].total_paid += _amount;
         emit Payment(msg.sender, _index, _amount);
-    }
-
-    function addToWhitelist(address[] calldata addresses) external onlyOwner {
-        for (uint256 i = 0; i < addresses.length; i++) {
-            whitelist[addresses[i]] = true;
-        }
     }
 
     function lastTimeRewardApplicable(uint256 _index)
@@ -133,7 +141,6 @@ contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
         updateTickets(msg.sender)
     {
         if (_amount == 0) revert ZeroAmount();
-        if (!whitelist[msg.sender]) revert NotWhitelisted(msg.sender);
         total_supply += _amount;
         balances[msg.sender] += _amount;
         IERC20(happy_token).transferFrom(msg.sender, address(this), _amount);
