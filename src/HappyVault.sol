@@ -1,202 +1,246 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "../Libraries/SafeBEP20.sol";
+import "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
+import "openzeppelin-contracts/contracts/access/Ownable.sol";
+import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 
-contract HappyVault is Ownable, ReentrancyGuard {
-    uint256 public periodFinish = 0; // mapping
-    uint256 public rewardRate = 0; // mapping
-    uint256 public lastUpdateTime; // mapping
-    uint256 public rewardPerTokenStored; // mapping
-
-    mapping(address => uint256) public userRewardPerTokenPaid; // mapping ticket
-    mapping(address => uint256) public rewards; // mapping ticket
-
+// TODO: needs a service to update whitelist from blockpass api
+// TODO: add events, comments
+contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
+    uint256 immutable SCALE = 1e18;
     struct Offering {
         address token;
+        address payment_token;
         uint256 duration;
         uint256 amount;
         uint256 price;
-        mapping(address => uint256) userRewardPerTokenPaid;
-        mapping(address => uint256) rewards;
+        uint256 staking_start;
+        uint256 staking_finish;
+        uint256 vesting_start;
+        uint256 rate;
+        uint256 last_update;
+        uint256 ticket_per_token_stored;
+        uint256 total_paid;
+        mapping(address => uint256) user_ticket_per_token;
+        mapping(address => uint256) tickets;
+        mapping(address => uint256) paid;
     }
     mapping(uint256 => Offering) public offerings;
-    uint256 private totalSupply;
-    mapping(address => uint256) private _balances; // mapping
-    uint256 private reward_amount;
+    mapping(address => uint256) public balances;
+    mapping(address => bool) public whitelist;
+    uint256 public total_supply;
+    uint256 public total_offerings;
+    address public happy_token;
 
-    /* ========== CONSTRUCTOR ========== */
-
-    constructor(address _rewardsToken, address _stakingToken) {
-        rewardsToken = IBEP20(_rewardsToken);
-        stakingToken = IBEP20(_stakingToken);
+    constructor(address _happy_token) {
+        happy_token = _happy_token;
     }
 
-    /* ========== VIEWS ========== */
+    error ZeroAmount();
+    error ZeroAddress();
+    error StakingNotFinished(uint256 _index);
+    error NotWhitelisted(address _address);
+    error RewardTooHigh(uint256 _index, uint256 _amount);
+    error InsufficientDeserved(
+        uint256 _index,
+        uint256 _amount,
+        uint256 _deserved
+    );
 
-    function totalStaked() external view returns (uint256) {
-        return _totalSupply;
+    event Staked(address indexed user, uint256 amount);
+    event Withdrawn(address indexed user, uint256 amount);
+    event OfferingCreated(uint256 indexed index);
+    event Payment(address indexed user, uint256 indexed index, uint256 amount);
+
+    function payLimited(uint256 _index, uint256 _amount) external {
+        if (offerings[_index].staking_finish < block.timestamp)
+            revert StakingNotFinished(_index);
+        if (_amount > deserved(_index, msg.sender))
+            revert InsufficientDeserved(
+                _index,
+                _amount,
+                deserved(_index, msg.sender)
+            );
+        offerings[_index].tickets[msg.sender] -= _amount;
+        offerings[_index].paid[msg.sender] += _amount;
+        offerings[_index].total_paid += _amount;
+        emit Payment(msg.sender, _index, _amount);
     }
 
-    function balanceOf(address account) external view returns (uint256) {
-        return _balances[account];
+    function payLimitless(uint256 _index, uint256 _amount) external {
+        if (offerings[_index].staking_finish < block.timestamp)
+            revert StakingNotFinished(_index);
+        if (_amount + offerings[_index].total_paid > offerings[_index].amount)
+            _amount = offerings[_index].amount - offerings[_index].total_paid;
+        offerings[_index].tickets[msg.sender] -= _amount;
+        offerings[_index].paid[msg.sender] += _amount;
+        offerings[_index].total_paid += _amount;
+        emit Payment(msg.sender, _index, _amount);
     }
 
-    function lastTimeRewardApplicable() public view returns (uint256) {
-        return block.timestamp < periodFinish ? block.timestamp : periodFinish;
+    function addToWhitelist(address[] calldata addresses) external onlyOwner {
+        for (uint256 i = 0; i < addresses.length; i++) {
+            whitelist[addresses[i]] = true;
+        }
     }
 
-    function rewardPerToken() public view returns (uint256) {
-        if (_totalSupply == 0) {
-            return rewardPerTokenStored;
+    function lastTimeRewardApplicable(uint256 _index)
+        public
+        view
+        returns (uint256)
+    {
+        return
+            block.timestamp < offerings[_index].staking_finish
+                ? block.timestamp
+                : offerings[_index].staking_finish;
+    }
+
+    function rewardPerToken(uint256 _index) public view returns (uint256) {
+        if (total_supply == 0) {
+            return offerings[_index].ticket_per_token_stored;
         }
         return
-            rewardPerTokenStored.add(
-                lastTimeRewardApplicable()
-                    .sub(lastUpdateTime)
-                    .mul(rewardRate)
-                    .mul(1e18)
-                    .div(_totalSupply)
-            );
+            offerings[_index].ticket_per_token_stored +
+            ((lastTimeRewardApplicable(_index) -
+                offerings[_index].last_update) *
+                offerings[_index].rate *
+                SCALE) /
+            total_supply;
     }
 
-    function earned(address account) public view returns (uint256) {
+    function deserved(uint256 _index, address _account)
+        public
+        view
+        returns (uint256)
+    {
         return
-            _balances[account]
-                .mul(rewardPerToken().sub(userRewardPerTokenPaid[account]))
-                .div(1e18)
-                .add(rewards[account]);
+            (balances[_account] *
+                (rewardPerToken(_index) -
+                    offerings[_index].user_ticket_per_token[_account])) /
+            SCALE +
+            offerings[_index].tickets[_account];
     }
 
-    function getRewardForDuration() external view returns (uint256) {
-        return rewardRate.mul(rewardsDuration);
+    function getRewardForDuration(uint256 _index)
+        external
+        view
+        returns (uint256)
+    {
+        return offerings[_index].rate * offerings[_index].duration;
     }
 
-    function totalRewardAdded() external view returns (uint256) {
-        return reward_amount;
-    }
-
-    /* ========== MUTATIVE FUNCTIONS ========== */
-
-    function stake(uint256 amount)
+    function stake(uint256 _amount)
         external
         nonReentrant
-        updateReward(msg.sender)
+        updateTickets(msg.sender)
     {
-        require(amount > 0, "Cannot stake 0");
-        _totalSupply = _totalSupply.add(amount);
-        _balances[msg.sender] = _balances[msg.sender].add(amount);
-        stakingToken.safeTransferFrom(msg.sender, address(this), amount);
-        emit Staked(msg.sender, amount);
+        if (_amount == 0) revert ZeroAmount();
+        if (!whitelist[msg.sender]) revert NotWhitelisted(msg.sender);
+        total_supply += _amount;
+        balances[msg.sender] += _amount;
+        IERC20(happy_token).transferFrom(msg.sender, address(this), _amount);
+        emit Staked(msg.sender, _amount);
     }
 
-    function unstake(uint256 amount)
+    function withdraw(uint256 _amount)
         public
         nonReentrant
-        updateReward(msg.sender)
-        isUnlocked(msg.sender)
+        updateTickets(msg.sender)
     {
-        require(amount > 0, "Cannot withdraw 0");
-        _totalSupply = _totalSupply.sub(amount);
-        _balances[msg.sender] = _balances[msg.sender].sub(amount);
-        stakingToken.safeTransfer(msg.sender, amount);
-        emit Withdrawn(msg.sender, amount);
+        if (_amount == 0) revert ZeroAmount();
+        total_supply -= _amount;
+        balances[msg.sender] -= _amount;
+        IERC20(happy_token).transfer(msg.sender, _amount);
+        emit Withdrawn(msg.sender, _amount);
     }
 
-    function getReward() public nonReentrant updateReward(msg.sender) {
-        uint256 reward = rewards[msg.sender];
-        if (reward > 0) {
-            rewards[msg.sender] = 0;
-            rewardsToken.safeTransfer(msg.sender, reward);
-            emit RewardPaid(msg.sender, reward);
-        }
-    }
-
-    function exit() external {
-        unstake(_balances[msg.sender]);
-        getReward();
-    }
-
-    /* ========== RESTRICTED FUNCTIONS ========== */
-
-    // Always needs to update the balance of the contract when calling this method
-    function notifyRewardAmount(uint256 reward)
+    function notifyRewardAmount(uint256 _index, uint256 _reward)
         external
         onlyOwner
-        updateReward(address(0))
+        updateTicket(_index, address(0))
     {
-        if (block.timestamp >= periodFinish) {
-            rewardRate = reward.div(rewardsDuration);
+        if (block.timestamp >= offerings[_index].staking_finish) {
+            offerings[_index].rate = _reward / offerings[_index].duration;
         } else {
-            uint256 remaining = periodFinish.sub(block.timestamp);
-            uint256 leftover = remaining.mul(rewardRate);
-            rewardRate = reward.add(leftover).div(rewardsDuration);
+            uint256 remaining = offerings[_index].staking_finish -
+                block.timestamp;
+            uint256 leftover = remaining * offerings[_index].rate;
+            offerings[_index].rate =
+                _reward +
+                (leftover / offerings[_index].duration);
         }
-
-        // Ensure the provided reward amount is not more than the balance in the contract.
-        // This keeps the reward rate in the right range, preventing overflows due to
-        // very high values of rewardRate in the earned and rewardsPerToken functions;
-        // Reward + leftover must be less than 2^256 / 10^18 to avoid overflow.
-        uint256 balance = rewardsToken.balanceOf(address(this));
-        require(
-            rewardRate <= balance.div(rewardsDuration),
-            "Provided reward too high"
+        uint256 balance = IERC20(offerings[_index].token).balanceOf(
+            address(this)
         );
-
-        reward_amount += reward;
-        lastUpdateTime = block.timestamp;
-        periodFinish = block.timestamp.add(rewardsDuration);
-        emit RewardAdded(reward);
+        if (offerings[_index].rate > balance / offerings[_index].duration)
+            revert RewardTooHigh(_index, balance / offerings[_index].duration);
+        offerings[_index].amount += _reward; // TODO: set not add?
+        offerings[_index].last_update = block.timestamp;
+        offerings[_index].staking_finish =
+            block.timestamp +
+            offerings[_index].duration;
     }
 
-    // Added to support recovering LP Rewards from other systems such as BAL to be distributed to holders
-    function recoverERC20(address tokenAddress, uint256 tokenAmount)
-        external
-        onlyOwner
-    {
-        require(
-            tokenAddress != address(stakingToken),
-            "Cannot withdraw the staking token"
-        );
-        IBEP20(tokenAddress).safeTransfer(owner(), tokenAmount);
-        emit Recovered(tokenAddress, tokenAmount);
+    function createOffering(
+        address _token,
+        address _payment_token,
+        uint256 _duration, // TODO: maybe get tge date instead of duration
+        uint256 _amount,
+        uint256 _price
+    ) public onlyOwner updateTicket(total_offerings, address(0)) {
+        if (_token == address(0)) revert ZeroAddress();
+        if (_payment_token == address(0)) revert ZeroAddress();
+        if (_duration == 0) revert ZeroAmount();
+        if (_amount == 0) revert ZeroAmount();
+        if (_price == 0) revert ZeroAmount();
+        total_offerings++;
+        offerings[total_offerings].token = _token;
+        offerings[total_offerings].payment_token = _payment_token;
+        offerings[total_offerings].duration = _duration;
+        offerings[total_offerings].amount = _amount;
+        offerings[total_offerings].price = _price;
+        offerings[total_offerings].staking_start = block.timestamp;
+        offerings[total_offerings].staking_finish = block.timestamp + _duration;
+        offerings[total_offerings].last_update = block.timestamp;
+        if (block.timestamp >= offerings[total_offerings].staking_finish) {
+            offerings[total_offerings].rate =
+                _amount /
+                offerings[total_offerings].duration;
+        } else {
+            uint256 remaining = offerings[total_offerings].staking_finish -
+                block.timestamp;
+            uint256 leftover = remaining * offerings[total_offerings].rate;
+            offerings[total_offerings].rate =
+                _amount +
+                (leftover / offerings[total_offerings].duration);
+        }
     }
 
-    function setRewardsDuration(uint256 _rewardsDuration) external onlyOwner {
-        require(
-            block.timestamp > periodFinish,
-            "Previous rewards period must be complete before changing the duration for the new period"
-        );
-        rewardsDuration = _rewardsDuration;
-        emit RewardsDurationUpdated(rewardsDuration);
-    }
-
-    function setUnlockDuration(uint256 _unlockDuration) external onlyOwner {
-        unlockDuration = _unlockDuration;
-        emit UnlockDurationUpdated(unlockDuration);
-    }
-
-    /* ========== MODIFIERS ========== */
-
-    modifier updateReward(address account) {
-        rewardPerTokenStored = rewardPerToken();
-        lastUpdateTime = lastTimeRewardApplicable();
-        if (account != address(0)) {
-            rewards[account] = earned(account);
-            userRewardPerTokenPaid[account] = rewardPerTokenStored;
+    modifier updateTicket(uint256 _index, address _account) {
+        offerings[_index].ticket_per_token_stored = rewardPerToken(_index);
+        offerings[_index].last_update = lastTimeRewardApplicable(_index);
+        if (_account != address(0)) {
+            offerings[_index].tickets[_account] = deserved(_index, _account);
+            offerings[_index].user_ticket_per_token[_account] = offerings[
+                _index
+            ].ticket_per_token_stored;
         }
         _;
     }
 
-    /* ========== EVENTS ========== */
-
-    event RewardAdded(uint256 reward);
-    event Staked(address indexed user, uint256 amount);
-    event Withdrawn(address indexed user, uint256 amount);
-    event RewardPaid(address indexed user, uint256 reward);
-    event RewardsDurationUpdated(uint256 newDuration);
-    event Recovered(address token, uint256 amount);
+    modifier updateTickets(address _account) {
+        for (uint256 i = 0; i < total_offerings; i++) {
+            if (offerings[i].staking_finish > block.timestamp) {
+                offerings[i].ticket_per_token_stored = rewardPerToken(i);
+                offerings[i].last_update = lastTimeRewardApplicable(i);
+                if (_account != address(0)) {
+                    offerings[i].tickets[_account] = deserved(i, _account);
+                    offerings[i].user_ticket_per_token[_account] = offerings[i]
+                        .ticket_per_token_stored;
+                }
+            }
+        }
+        _;
+    }
 }
