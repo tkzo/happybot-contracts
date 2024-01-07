@@ -4,10 +4,7 @@ pragma solidity ^0.8.20;
 import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
-import {console2} from "forge-std/Test.sol";
 
-// TODO: needs a service to update whitelist from blockpass api
-// TODO: add events, comments
 contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
     uint256 immutable SCALE = 1e18;
     struct Offering {
@@ -115,13 +112,6 @@ contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
         view
         returns (uint256)
     {
-        console2.log("Balance:", balances[_account]);
-        console2.log("Reward per token:", rewardPerToken(_index));
-        console2.log(
-            "User ticket per token:",
-            offerings[_index].user_ticket_per_token[_account]
-        );
-        console2.log("Tickets:", offerings[_index].tickets[_account]);
         return
             ((balances[_account] *
                 (rewardPerToken(_index) -
