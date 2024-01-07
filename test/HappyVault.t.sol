@@ -50,6 +50,10 @@ contract HappyVaultTest is Test {
         assertEq(happy_vault.balances(address(this)), STAKE_AMOUNT);
         assertEq(happy_vault.deserved(0, address(this)), 0);
         vm.warp(block.timestamp + 31 * DAY);
-        assertGe(happy_vault.deserved(0, address(this)), SALE_AMOUNT - 1 ether);
+        assertApproxEqAbs(
+            happy_vault.deserved(0, address(this)),
+            SALE_AMOUNT,
+            1e6
+        );
     }
 }
