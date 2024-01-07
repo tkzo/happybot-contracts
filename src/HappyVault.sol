@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
-import "openzeppelin-contracts/contracts/access/Ownable.sol";
-import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
+import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {console2} from "forge-std/Test.sol";
 
 // TODO: needs a service to update whitelist from blockpass api
 // TODO: add events, comments
@@ -114,12 +115,18 @@ contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
         view
         returns (uint256)
     {
+        console2.log("Balance:", balances[_account]);
+        console2.log("Reward per token:", rewardPerToken(_index));
+        console2.log(
+            "User ticket per token:",
+            offerings[_index].user_ticket_per_token[_account]
+        );
+        console2.log("Tickets:", offerings[_index].tickets[_account]);
         return
-            (balances[_account] *
+            ((balances[_account] *
                 (rewardPerToken(_index) -
                     offerings[_index].user_ticket_per_token[_account])) /
-            SCALE +
-            offerings[_index].tickets[_account];
+                SCALE) + offerings[_index].tickets[_account];
     }
 
     function getRewardForDuration(uint256 _index)
@@ -155,33 +162,6 @@ contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
         emit Withdrawn(msg.sender, _amount);
     }
 
-    function notifyRewardAmount(uint256 _index, uint256 _reward)
-        external
-        onlyOwner
-        updateTicket(_index, address(0))
-    {
-        if (block.timestamp >= offerings[_index].staking_finish) {
-            offerings[_index].rate = _reward / offerings[_index].duration;
-        } else {
-            uint256 remaining = offerings[_index].staking_finish -
-                block.timestamp;
-            uint256 leftover = remaining * offerings[_index].rate;
-            offerings[_index].rate =
-                _reward +
-                (leftover / offerings[_index].duration);
-        }
-        uint256 balance = IERC20(offerings[_index].token).balanceOf(
-            address(this)
-        );
-        if (offerings[_index].rate > balance / offerings[_index].duration)
-            revert RewardTooHigh(_index, balance / offerings[_index].duration);
-        offerings[_index].amount += _reward; // TODO: set not add?
-        offerings[_index].last_update = block.timestamp;
-        offerings[_index].staking_finish =
-            block.timestamp +
-            offerings[_index].duration;
-    }
-
     function createOffering(
         address _token,
         address _payment_token,
@@ -194,7 +174,6 @@ contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
         if (_duration == 0) revert ZeroAmount();
         if (_amount == 0) revert ZeroAmount();
         if (_price == 0) revert ZeroAmount();
-        total_offerings++;
         offerings[total_offerings].token = _token;
         offerings[total_offerings].payment_token = _payment_token;
         offerings[total_offerings].duration = _duration;
@@ -203,18 +182,9 @@ contract HappyVault is ReentrancyGuard, Ownable(msg.sender) {
         offerings[total_offerings].staking_start = block.timestamp;
         offerings[total_offerings].staking_finish = block.timestamp + _duration;
         offerings[total_offerings].last_update = block.timestamp;
-        if (block.timestamp >= offerings[total_offerings].staking_finish) {
-            offerings[total_offerings].rate =
-                _amount /
-                offerings[total_offerings].duration;
-        } else {
-            uint256 remaining = offerings[total_offerings].staking_finish -
-                block.timestamp;
-            uint256 leftover = remaining * offerings[total_offerings].rate;
-            offerings[total_offerings].rate =
-                _amount +
-                (leftover / offerings[total_offerings].duration);
-        }
+        offerings[total_offerings].rate = _amount / _duration;
+        total_offerings++;
+        emit OfferingCreated(total_offerings);
     }
 
     modifier updateTicket(uint256 _index, address _account) {
